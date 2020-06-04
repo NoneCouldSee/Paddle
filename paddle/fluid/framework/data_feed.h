@@ -715,6 +715,374 @@ class PaddleBoxDataFeed : public MultiSlotInMemoryDataFeed {
   std::vector<PvInstance> pv_vec_;
 };
 
+#ifdef PADDLE_WITH_BOX_PS
+// sizeof Record is much less than std::vector<MultiSlotType>
+struct SlotRecordObject {
+  uint64_t search_id;
+  uint32_t rank;
+  uint32_t cmatch;
+  std::string ins_id_;
+  std::vector<std::vector<uint64_t>> slot_uint64_feasigns_;
+  std::vector<std::vector<float>> slot_float_feasigns_;
+
+  void reset(void) {
+    for(auto &t : slot_uint64_feasigns_) {
+      t.clear();
+    }
+    for (auto &t : slot_float_feasigns_) {
+      t.clear();
+    }
+  }
+};
+using SlotRecord = SlotRecordObject*;
+inline SlotRecord make_slotrecord() {
+  return new SlotRecordObject();
+}
+
+struct SlotPvInstanceObject {
+  std::vector<SlotRecord> ads;
+  void merge_instance(SlotRecord ins) {
+    ads.push_back(ins);
+  }
+};
+
+using SlotPvInstance = SlotPvInstanceObject*;
+inline SlotPvInstance make_slotpv_instance() { return new SlotPvInstanceObject(); }
+
+template<class T>
+class SlotObjAllocator {
+public:
+  explicit SlotObjAllocator() {
+    free_nodes_ = NULL;
+    capacity_ = 0;
+  }
+  ~SlotObjAllocator() {
+    clear();
+  }
+
+  void clear(void) {
+    T* tmp = NULL;
+    while (free_nodes_ != NULL) {
+      tmp = (T*) (void*) free_nodes_;
+      free_nodes_ = free_nodes_->next;
+      delete tmp;
+    }
+    capacity_ = 0;
+  }
+  T* acquire(void) {
+    T *x = NULL;
+    if (free_nodes_ == NULL) {
+      x = new T;
+    } else {
+      x = (T*) (void*) free_nodes_;
+      free_nodes_ = free_nodes_->next;
+      --capacity_;
+    }
+    return x;
+  }
+  void release(T* x) {
+    Node *node = (Node*) (void*) x;
+    node->next = free_nodes_;
+    free_nodes_ = node;
+    ++capacity_;
+  }
+  size_t capacity(void) {
+    return capacity_;
+  }
+private:
+  struct alignas(T) Node {
+    union {
+      Node* next;
+      char data[sizeof(T)];
+    };
+  };
+  Node* free_nodes_; // a list
+  size_t capacity_;
+};
+
+class SlotObjPool {
+public:
+  SlotObjPool() : max_capacity_(10000000){
+    ins_chan_ = MakeChannel<SlotRecord>();
+    thread_ = std::thread([this]() {
+      run();
+    });
+  }
+  ~SlotObjPool() {
+    ins_chan_->Close();
+    thread_.join();
+  }
+  void set_max_capacity(size_t max_capacity) {
+    max_capacity_ = max_capacity;
+  }
+  void get(std::vector<SlotRecord>& output, int n) {
+    output.resize(n);
+
+    int size = 0;
+    mutex_.lock();
+    int left = (int)alloc_.capacity();
+    if (left > 0) {
+       size = (left >= n) ? n: left;
+       for (int i = 0; i < size; ++i) {
+           output[i] = alloc_.acquire();
+       }
+    }
+    mutex_.unlock();
+
+    if (size == n) {
+       return;
+    }
+    for (int i = size; i < n; ++i) {
+       output[i] = make_slotrecord();
+    }
+  }
+  void put(std::vector<SlotRecord>& input) {
+    size_t size = input.size();
+    if (size == 0) {
+      return;
+    }
+    put((SlotRecord *) &input[0], size);
+    input.clear();
+    input.shrink_to_fit();
+  }
+  void put(SlotRecord *input, size_t size) {
+    ins_chan_->WriteMove(size, input);
+  }
+  void run(void) {
+    std::vector<SlotRecord> input;
+    while (ins_chan_->Read(input)) {
+      if (input.empty()) {
+        continue;
+      }
+      // over max capacity
+      if (input.size() + capacity() > max_capacity_) {
+        for (auto &t : input) {
+          delete t;
+        }
+      } else {
+        mutex_.lock();
+        for (auto &t : input) {
+          t->reset();
+          alloc_.release(t);
+        }
+        mutex_.unlock();
+      }
+      input.clear();
+    }
+  }
+  void clear(void) {
+    mutex_.lock();
+    alloc_.clear();
+    mutex_.unlock();
+  }
+  size_t capacity(void) {
+    mutex_.lock();
+    size_t total = alloc_.capacity();
+    mutex_.unlock();
+    return total;
+  }
+
+private:
+  size_t max_capacity_;
+  Channel<SlotRecord> ins_chan_;
+  std::thread thread_;
+  std::mutex mutex_;
+  SlotObjAllocator<SlotRecordObject> alloc_;
+};
+
+inline SlotObjPool& SlotRecordPool() {
+    static SlotObjPool pool;
+    return pool;
+}
+
+struct AllSlotInfo {
+  std::string slot;
+  std::string type;
+  int used_idx;
+  int slot_value_idx;
+};
+
+class ISlotParser {
+public:
+    virtual ~ISlotParser() {}
+    virtual bool Init(const std::vector<AllSlotInfo> &slots) = 0;
+    virtual bool ParseOneInstance(const std::string &line,
+        std::function<void(std::vector<SlotRecord> &, int)> GetInsFunc) = 0;
+};
+
+class SlotPaddleBoxDataFeed : public DataFeed {
+  struct UsedSlotInfo {
+    int idx;
+    int slot_value_idx;
+    std::string slot;
+    std::string type;
+    bool dense;
+    std::vector<int> local_shape;
+    int total_dims_without_inductive;
+    int inductive_shape_index;
+  };
+ public:
+  SlotPaddleBoxDataFeed() {}
+  virtual ~SlotPaddleBoxDataFeed() {}
+
+  // This function will do nothing at default
+  virtual void SetInputChannel(void* channel) {
+    input_channel_ = static_cast<ChannelObject<SlotRecord> *>(channel);
+  }
+  // This function will do nothing at default
+  virtual void SetThreadId(int thread_id) {
+    thread_id_ = thread_id;
+  }
+  // This function will do nothing at default
+  virtual void SetThreadNum(int thread_num) {
+    thread_num_ = thread_num;
+  }
+  // This function will do nothing at default
+  virtual void SetParseInsId(bool parse_ins_id) {
+    parse_ins_id_ = parse_ins_id;
+  }
+  virtual void SetParseLogKey(bool parse_logkey) {
+    parse_logkey_ = parse_logkey;
+  }
+  virtual void SetEnablePvMerge(bool enable_pv_merge) {
+    enable_pv_merge_ = enable_pv_merge;
+  }
+  virtual void SetCurrentPhase(int current_phase) {
+    current_phase_ = current_phase;
+  }
+
+public:
+  int GetBatchSize() {
+    return default_batch_size_;
+  }
+  int GetPvBatchSize() {
+    return pv_batch_size_;
+  }
+  void SetPvInstance(SlotPvInstance *pv_ins) {
+    pv_ins_ = pv_ins;
+  }
+  void SetSlotRecord(SlotRecord *records) {
+    records_ = records;
+  }
+  void AddBatchOffset(std::pair<int, int> &off) {
+    batch_offsets_.push_back(off);
+  }
+  void GetUsedSlot(std::vector<bool> &used_slot_index);
+
+ public:
+  virtual void Init(const DataFeedDesc& data_feed_desc);
+  virtual bool Start();
+  virtual int Next();
+  virtual void AssignFeedVar(const Scope& scope);
+  virtual int GetCurrentPhase();
+  virtual void LoadIntoMemory();
+
+ private:
+  void LoadIntoMemoryByCommand(void);
+  void LoadIntoMemoryByLib(void);
+  void PutToFeedPvVec(const SlotPvInstance *pvs, int num);
+  void PutToFeedSlotVec(const SlotRecord* recs, int num);
+  void GetRankOffset(const SlotPvInstance *pv_vec, int pv_num,
+      int ins_number);
+  bool ParseOneInstance(const std::string &line, SlotRecord &rec);
+
+
+ private:
+  int thread_id_ = 0;
+  int thread_num_ = 0;
+  bool parse_ins_id_ = false;
+  bool parse_content_ = false;
+  bool parse_logkey_ = false;
+  bool enable_pv_merge_ = false;
+  int current_phase_ { -1 };  // only for untest
+  std::shared_ptr<FILE> fp_ = nullptr;
+  ChannelObject<SlotRecord> *input_channel_ = nullptr;
+
+  std::vector<std::vector<float>> batch_float_feasigns_;
+  std::vector<std::vector<uint64_t>> batch_uint64_feasigns_;
+  std::vector<std::vector<size_t>> offset_;
+
+  std::string rank_offset_name_;
+  int pv_batch_size_ = 0;
+  int use_slot_size_ = 0;
+  int float_use_slot_size_ = 0;
+  int uint64_use_slot_size_ = 0;
+
+  int offset_index_ = 0;
+  std::vector<std::pair<int, int>> batch_offsets_;
+  SlotPvInstance *pv_ins_;
+  SlotRecord *records_;
+  std::vector<AllSlotInfo>  all_slots_info_;
+  std::vector<UsedSlotInfo> used_slots_info_;
+};
+
+template <class AR>
+paddle::framework::Archive<AR>& operator<<(paddle::framework::Archive<AR>& ar, const SlotRecord& r) {
+  uint16_t fea_num = 0;
+  uint16_t num = (uint16_t)r->slot_uint64_feasigns_.size();
+  ar << num;
+  for (uint16_t i = 0; i < num; ++i) {
+    auto &uint64_feas = r->slot_uint64_feasigns_[i];
+    fea_num = (uint16_t)uint64_feas.size();
+    ar << fea_num;
+    if (fea_num > 0) {
+      ar.Write(uint64_feas.data(), fea_num * sizeof(uint64_t));
+    }
+  }
+
+  num = (uint16_t)r->slot_float_feasigns_.size();
+  ar << num;
+  for (uint16_t i = 0; i < num; ++i) {
+    auto &float_feas = r->slot_float_feasigns_[i];
+    fea_num = (uint16_t)float_feas.size();
+    ar << fea_num;
+    if (fea_num > 0) {
+      ar.Write(float_feas.data(), fea_num * sizeof(float));
+    }
+  }
+  ar << r->ins_id_;
+  ar << r->search_id;
+  ar << r->rank;
+  ar << r->cmatch;
+
+  return ar;
+}
+
+template <class AR>
+paddle::framework::Archive<AR>& operator>>(paddle::framework::Archive<AR>& ar, SlotRecord& r) {
+  uint16_t num = 0;
+  uint16_t fea_num = 0;
+
+  ar >> num;
+  r->slot_uint64_feasigns_.resize(num);
+  for (uint16_t i = 0; i < num; ++i) {
+    ar >> fea_num;
+    if (fea_num > 0) {
+      auto &uint64_feas = r->slot_uint64_feasigns_[i];
+      uint64_feas.resize(fea_num);
+      ar.Read(uint64_feas.data(), fea_num * sizeof(uint64_t));
+    }
+  }
+
+  ar >> num;
+  r->slot_float_feasigns_.resize(num);
+  for (uint16_t i = 0; i < num; ++i) {
+    ar >> fea_num;
+    if (fea_num > 0) {
+      auto &float_feas = r->slot_float_feasigns_[i];
+      float_feas.resize(fea_num);
+      ar.Read(float_feas.data(), fea_num * sizeof(float));
+    }
+  }
+  ar >> r->ins_id_;
+  ar >> r->search_id;
+  ar >> r->rank;
+  ar >> r->cmatch;
+
+  return ar;
+}
+#endif
+
 #if defined(PADDLE_WITH_CUDA) && !defined(_WIN32)
 template <typename T>
 class PrivateInstantDataFeed : public DataFeed {

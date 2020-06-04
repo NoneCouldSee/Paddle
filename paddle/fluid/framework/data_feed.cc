@@ -37,6 +37,14 @@ limitations under the License. */
 #include "paddle/fluid/framework/fleet/fleet_wrapper.h"
 #include "paddle/fluid/platform/timer.h"
 
+#ifdef PADDLE_WITH_BOX_PS
+#include <dlfcn.h>
+extern "C" {
+  typedef paddle::framework::ISlotParser* (*MyPadBoxGetObject)(void);
+  typedef void (*MyPadBoxFreeObject)(paddle::framework::ISlotParser *);
+}
+#endif
+
 namespace paddle {
 namespace framework {
 using platform::Timer;
@@ -392,7 +400,7 @@ void InMemoryDataFeed<T>::LoadIntoMemory() {
             << ", thread_id=" << thread_id_;
 #ifdef PADDLE_WITH_BOX_PS
     if (BoxWrapper::GetInstance()->UseAfsApi()) {
-      this->fp_ = BoxWrapper::GetInstance()->afs_manager->GetFile(
+      this->fp_ = BoxWrapper::GetInstance()->OpenReadFile(
           filename, this->pipe_command_);
     } else {
 #endif
@@ -1685,5 +1693,680 @@ void PaddleBoxDataFeed::PutToFeedVec(const std::vector<Record*>& ins_vec) {
 #endif
 }
 
+
+//================================ new boxps =============================================
+#ifdef PADDLE_WITH_BOX_PS
+void SlotPaddleBoxDataFeed::Init(const DataFeedDesc& data_feed_desc) {
+  finish_init_ = false;
+  finish_set_filelist_ = false;
+  finish_start_ = false;
+
+  PADDLE_ENFORCE(data_feed_desc.has_multi_slot_desc(),
+      "Multi_slot_desc has not been set.");
+  paddle::framework::MultiSlotDesc multi_slot_desc =
+      data_feed_desc.multi_slot_desc();
+  SetBatchSize(data_feed_desc.batch_size());
+  size_t all_slot_num = multi_slot_desc.slots_size();
+
+  all_slots_.resize(all_slot_num);
+  all_slots_info_.resize(all_slot_num);
+  used_slots_info_.resize(all_slot_num);
+  use_slot_size_ = 0;
+  use_slots_.clear();
+
+  for (size_t i = 0; i < all_slot_num; ++i) {
+    const auto& slot = multi_slot_desc.slots(i);
+    all_slots_[i] = slot.name();
+
+    AllSlotInfo &all_slot = all_slots_info_[i];
+    all_slot.slot = slot.name();
+    all_slot.type = slot.type();
+    all_slot.used_idx = slot.is_used() ? use_slot_size_ : -1;
+    all_slot.slot_value_idx = -1;
+
+    if (slot.is_used()) {
+      UsedSlotInfo &info = used_slots_info_[use_slot_size_];
+      info.idx = i;
+      info.slot = slot.name();
+      info.type = slot.type();
+      info.dense = slot.is_dense();
+      info.total_dims_without_inductive = 1;
+      info.inductive_shape_index = -1;
+
+      // record float value and uint64_t value pos
+      if (info.type[0] == 'u') {
+        info.slot_value_idx = uint64_use_slot_size_;
+        all_slot.slot_value_idx = uint64_use_slot_size_;
+        ++uint64_use_slot_size_;
+      } else if (info.type[0] == 'f') {
+        info.slot_value_idx = float_use_slot_size_;
+        all_slot.slot_value_idx = float_use_slot_size_;
+        ++float_use_slot_size_;
+      }
+
+      use_slots_.push_back(slot.name());
+
+      if (slot.is_dense()) {
+        for (int j = 0; j < slot.shape_size(); ++j) {
+          if (slot.shape(j) > 0) {
+            info.total_dims_without_inductive *= slot.shape(j);
+          }
+          if (slot.shape(j) == -1) {
+            info.inductive_shape_index = j;
+          }
+        }
+      }
+
+      info.local_shape.clear();
+      for (int j = 0; j < slot.shape_size(); ++j) {
+        info.local_shape.push_back(slot.shape(j));
+      }
+      ++use_slot_size_;
+    }
+  }
+  used_slots_info_.resize(use_slot_size_);
+
+  feed_vec_.resize(used_slots_info_.size());
+  const int kEstimatedFeasignNumPerSlot = 5;  // Magic Number
+  for (size_t i = 0; i < all_slot_num; i++) {
+    batch_float_feasigns_.push_back(std::vector<float>());
+    batch_uint64_feasigns_.push_back(std::vector<uint64_t>());
+    batch_float_feasigns_[i].reserve(
+        default_batch_size_ * kEstimatedFeasignNumPerSlot);
+    batch_uint64_feasigns_[i].reserve(
+        default_batch_size_ * kEstimatedFeasignNumPerSlot);
+    offset_.push_back(std::vector<size_t>());
+    offset_[i].reserve(default_batch_size_ + 1); // Each lod info will prepend a zero
+  }
+  pipe_command_ = data_feed_desc.pipe_command();
+  finish_init_ = true;
+  input_type_ = data_feed_desc.input_type();
+
+  rank_offset_name_ = data_feed_desc.rank_offset();
+  pv_batch_size_ = data_feed_desc.pv_batch_size();
+}
+void SlotPaddleBoxDataFeed::GetUsedSlot(std::vector<bool> &used_slot_index) {
+  auto boxps_ptr = BoxWrapper::GetInstance();
+  // get feasigns that FeedPass doesn't need
+  const std::unordered_set<std::string>& slot_name_omited_in_feedpass_ = boxps_ptr->GetOmitedSlot();
+  used_slot_index.assign(use_slot_size_, false);
+  for (int i = 0; i < use_slot_size_; ++i) {
+    auto &info = used_slots_info_[i];
+    if (slot_name_omited_in_feedpass_.find(info.slot) ==
+        slot_name_omited_in_feedpass_.end()) {
+      used_slot_index[info.slot_value_idx] = true;
+    }
+  }
+}
+bool SlotPaddleBoxDataFeed::Start() {
+  this->CheckSetFileList();
+  this->offset_index_ = 0;
+  this->finish_start_ = true;
+  return true;
+}
+int SlotPaddleBoxDataFeed::Next() {
+  int phase = GetCurrentPhase();  // join: 1, update: 0
+  this->CheckStart();
+  if (offset_index_ >= (int)batch_offsets_.size()) {
+    return 0;
+  }
+  auto &batch = batch_offsets_[offset_index_++];
+  if (enable_pv_merge_ && phase == 1) {
+    // join phase : output_pv_channel to consume_pv_channel
+    this->batch_size_ = batch.second;
+    if (this->batch_size_ != 0) {
+      PutToFeedPvVec(&pv_ins_[batch.first], this->batch_size_);
+    } else {
+      VLOG(3) << "finish reading, batch size zero, thread_id=" << thread_id_;
+    }
+    return this->batch_size_;
+  } else {
+    this->batch_size_ = batch.second;
+    PutToFeedSlotVec(&records_[batch.first], this->batch_size_);
+    return this->batch_size_;
+  }
+}
+void SlotPaddleBoxDataFeed::AssignFeedVar(const Scope& scope) {
+  CheckInit();
+  for (int i = 0; i < use_slot_size_; ++i) {
+    feed_vec_[i] = scope.FindVar(used_slots_info_[i].slot)->GetMutable<LoDTensor>();
+  }
+  // set rank offset memory
+  int phase = GetCurrentPhase();  // join: 1, update: 0
+  if (enable_pv_merge_ && phase == 1) {
+    rank_offset_ = scope.FindVar(rank_offset_name_)->GetMutable<LoDTensor>();
+  }
+}
+void SlotPaddleBoxDataFeed::PutToFeedPvVec(const SlotPvInstance *pvs, int num) {
+  int ins_number = 0;
+  std::vector<SlotRecord> ins_vec;
+  for (int i = 0; i < num; ++i) {
+    auto &pv = pvs[i];
+    ins_number += pv->ads.size();
+    for (auto ins : pv->ads) {
+      ins_vec.push_back(ins);
+    }
+  }
+  GetRankOffset(pvs, num, ins_number);
+  PutToFeedSlotVec(&ins_vec[0], ins_number);
+}
+void SlotPaddleBoxDataFeed::PutToFeedSlotVec(const SlotRecord* ins_vec, int num) {
+  for (size_t i = 0; i < batch_float_feasigns_.size(); ++i) {
+    batch_float_feasigns_[i].clear();
+    batch_uint64_feasigns_[i].clear();
+    offset_[i].clear();
+    offset_[i].push_back(0);
+  }
+
+  for (int i = 0; i < num; ++i) {
+    auto r = ins_vec[i];
+    for (int j = 0; j < use_slot_size_; ++j) {
+      const auto& info = used_slots_info_[j];
+      // fill slot value with default value 0
+      if (info.type[0] == 'f') {  // float
+        auto &batch_fea = batch_float_feasigns_[j];
+        auto &ins_fea = r->slot_float_feasigns_[info.slot_value_idx];
+        if (ins_fea.empty()) {
+          batch_fea.push_back(0.0);
+        } else {
+          batch_fea.insert(batch_fea.end(), ins_fea.begin(), ins_fea.end());
+        }
+        offset_[j].push_back(batch_float_feasigns_[j].size());
+      } else if (info.type[0] == 'u') {  // uint64
+        auto &batch_fea = batch_uint64_feasigns_[j];
+        auto &ins_fea = r->slot_uint64_feasigns_[info.slot_value_idx];
+        if (ins_fea.empty()) {
+          batch_fea.push_back(0);
+        } else {
+          batch_fea.insert(batch_fea.end(), ins_fea.begin(), ins_fea.end());
+        }
+        offset_[j].push_back(batch_uint64_feasigns_[j].size());
+      }
+    }
+  }
+
+  for (int i = 0; i < use_slot_size_; ++i) {
+    if (feed_vec_[i] == nullptr) {
+      continue;
+    }
+    int total_instance = offset_[i].back();
+    auto &used_slot = used_slots_info_[i];
+    if (used_slot.type[0] == 'f') {  // float
+      float* feasign = batch_float_feasigns_[i].data();
+      float* tensor_ptr = feed_vec_[i]->mutable_data<float>(
+          { total_instance, 1 }, this->place_);
+      CopyToFeedTensor(tensor_ptr, feasign, total_instance * sizeof(float));
+    } else if (used_slot.type[0] == 'u') {  // uint64
+      // no uint64_t type in paddlepaddle
+      uint64_t* feasign = batch_uint64_feasigns_[i].data();
+      int64_t* tensor_ptr = feed_vec_[i]->mutable_data<int64_t>( {
+          total_instance, 1 }, this->place_);
+      CopyToFeedTensor(tensor_ptr, feasign, total_instance * sizeof(int64_t));
+    }
+    auto& slot_offset = offset_[i];
+    LoD data_lod { slot_offset };
+    feed_vec_[i]->set_lod(data_lod);
+
+    if (used_slot.dense) {
+      if (used_slot.inductive_shape_index != -1) {
+        used_slot.local_shape[used_slot.inductive_shape_index] = total_instance
+            / used_slot.total_dims_without_inductive;
+      }
+      feed_vec_[i]->Resize(framework::make_ddim(used_slot.local_shape));
+    }
+  }
+}
+int SlotPaddleBoxDataFeed::GetCurrentPhase() {
+  auto box_ptr = paddle::framework::BoxWrapper::GetInstance();
+  if (box_ptr->Mode() == 1) {  // For AucRunner
+    return 1;
+  } else {
+    return box_ptr->Phase();
+  }
+}
+void SlotPaddleBoxDataFeed::GetRankOffset(
+    const SlotPvInstance *pv_vec, int pv_num,
+    int ins_number) {
+  int index = 0;
+  int max_rank = 3;  // the value is setting
+  int row = ins_number;
+  int col = max_rank * 2 + 1;
+
+  std::vector<int> rank_offset_mat(row * col, -1);
+  rank_offset_mat.shrink_to_fit();
+
+  for (int i = 0; i < pv_num; i++) {
+    auto pv_ins = pv_vec[i];
+    int ad_num = pv_ins->ads.size();
+    int index_start = index;
+    for (int j = 0; j < ad_num; ++j) {
+      auto ins = pv_ins->ads[j];
+      int rank = -1;
+      if ((ins->cmatch == 222 || ins->cmatch == 223) &&
+          ins->rank <= static_cast<uint32_t>(max_rank) && ins->rank != 0) {
+        rank = ins->rank;
+      }
+
+      rank_offset_mat[index * col] = rank;
+      if (rank > 0) {
+        for (int k = 0; k < ad_num; ++k) {
+          auto cur_ins = pv_ins->ads[k];
+          int fast_rank = -1;
+          if ((cur_ins->cmatch == 222 || cur_ins->cmatch == 223) &&
+              cur_ins->rank <= static_cast<uint32_t>(max_rank) &&
+              cur_ins->rank != 0) {
+            fast_rank = cur_ins->rank;
+          }
+
+          if (fast_rank > 0) {
+            int m = fast_rank - 1;
+            rank_offset_mat[index * col + 2 * m + 1] = cur_ins->rank;
+            rank_offset_mat[index * col + 2 * m + 2] = index_start + k;
+          }
+        }
+      }
+      index += 1;
+    }
+  }
+
+  int* rank_offset = rank_offset_mat.data();
+  int* tensor_ptr = rank_offset_->mutable_data<int>({row, col}, this->place_);
+  CopyToFeedTensor(tensor_ptr, rank_offset, row * col * sizeof(int));
+}
+
+class BufferedLineFileReader {
+  static const int MAX_FILE_BUFF_SIZE = 4 * 1024 * 1024;
+  class FILEReader {
+  public:
+    FILEReader(FILE *fp) : fp_(fp) {}
+    int read(char *buf, int len) {
+      return fread(buf, sizeof(char), len, fp_);
+    }
+  private:
+    FILE *fp_;
+  };
+private:
+  template<typename T>
+  int read_lines(T *reader, std::function<void(const std::string &s)> func) {
+    int lines = 0;
+    size_t ret = 0;
+    char *ptr = NULL;
+    char *eol = NULL;
+    _total_len = 0;
+
+    std::string x;
+    while ((ret = reader->read(_buff, MAX_FILE_BUFF_SIZE)) > 0) {
+      _total_len += ret;
+      ptr = _buff;
+      eol = (char *) memchr(ptr, '\n', ret);
+      while (eol != NULL) {
+        int size = (int) (eol - ptr) + 1;
+        x.append(ptr, size - 1);
+        ++lines;
+        func(x);
+
+        x.clear();
+        ptr += size;
+        ret -= size;
+        eol = (char *) memchr(ptr, '\n', ret);
+      }
+      if (ret > 0) {
+        x.append(ptr, ret);
+      }
+    }
+    if (!x.empty()) {
+      ++lines;
+      func(x);
+    }
+    return lines;
+  }
+public:
+  BufferedLineFileReader() {
+    _total_len = 0;
+    _buff = (char *) calloc(MAX_FILE_BUFF_SIZE + 1, sizeof(char));
+  }
+  ~BufferedLineFileReader() {
+    free(_buff);
+  }
+
+  int read_api(boxps::PaddleDataReader *reader,
+      std::function<void(const std::string &s)> func) {
+    return read_lines<boxps::PaddleDataReader>(reader, func);
+  }
+
+  int read_file(FILE *fp,
+      std::function<void(const std::string &s)> func) {
+    FILEReader reader(fp);
+    return read_lines<FILEReader>(&reader, func);
+  }
+  uint64_t file_size(void) {
+    return _total_len;
+  }
+private:
+  char *_buff = nullptr;
+  uint64_t _total_len = 0;
+};
+
+class SlotInsParserMgr {
+  struct ParserInfo {
+    void *hmodule = nullptr;
+    paddle::framework::ISlotParser *parser = nullptr;
+  };
+public:
+  SlotInsParserMgr() {}
+  ~SlotInsParserMgr() {
+    if (obj_map_.empty()) {
+      return;
+    }
+
+    mutex_.lock();
+    for (auto it = obj_map_.begin(); it != obj_map_.end(); ++it) {
+      auto &info = it->second;
+      MyPadBoxFreeObject func_freeobj = (MyPadBoxFreeObject) dlsym(info.hmodule, "PadBoxFreeObject");
+      if (func_freeobj) {
+        func_freeobj(info.parser);
+      }
+      dlclose(info.hmodule);
+    }
+    obj_map_.clear();
+    mutex_.unlock();
+  }
+
+  paddle::framework::ISlotParser *Get(const std::string &path,
+      const std::vector<AllSlotInfo> &slots) {
+    ParserInfo info;
+
+    mutex_.lock();
+    info.hmodule = dlopen(path.c_str(), RTLD_NOW);
+    if (info.hmodule == nullptr) {
+      mutex_.unlock();
+      LOG(FATAL) << "open so path:[" << path << "] failed";
+      return nullptr;
+    }
+    MyPadBoxGetObject func_getobj = (MyPadBoxGetObject) dlsym(info.hmodule, "PadBoxGetObject");
+    if (func_getobj) {
+      info.parser = func_getobj();
+      if (!info.parser->Init(slots)) {
+        mutex_.unlock();
+        LOG(FATAL) << "init so path:[" << path << "] failed";
+        return nullptr;
+      }
+    }
+    obj_map_.insert(std::make_pair(path, info));
+    mutex_.unlock();
+
+    return info.parser;
+  }
+
+private:
+  std::mutex mutex_;
+  std::map<std::string, ParserInfo> obj_map_;
+};
+
+SlotInsParserMgr &global_parser_pool() {
+  static SlotInsParserMgr pool;
+  return pool;
+}
+
+void SlotPaddleBoxDataFeed::LoadIntoMemory() {
+  VLOG(3) << "LoadIntoMemory() begin, thread_id=" << thread_id_;
+  if (this->pipe_command_.find(".so") != std::string::npos) {
+    LoadIntoMemoryByLib();
+  } else {
+    LoadIntoMemoryByCommand();
+  }
+}
+
+void SlotPaddleBoxDataFeed::LoadIntoMemoryByLib(void) {
+  paddle::framework::ISlotParser *parser = global_parser_pool().Get(
+      this->pipe_command_, all_slots_info_);
+  CHECK(parser != nullptr);
+
+  boxps::PaddleDataReader *reader = nullptr;
+  if (BoxWrapper::GetInstance()->UseAfsApi()) {
+    reader = boxps::PaddleDataReader::New(BoxWrapper::GetInstance()->GetFileMgr());
+  }
+
+  std::string filename;
+  BufferedLineFileReader line_reader;
+  while (this->PickOneFile(&filename)) {
+    VLOG(3) << "PickOneFile, filename=" << filename
+            << ", thread_id=" << thread_id_;
+    std::vector<SlotRecord> record_vec;
+    platform::Timer timeline;
+    timeline.Start();
+    int max_fetch_num = 10000;
+    int offset = 0;
+
+    SlotRecordPool().get(record_vec, max_fetch_num);
+    auto func = [this, &parser, &record_vec, &offset, &max_fetch_num](const std::string &line){
+      auto &rec = record_vec[offset];
+      rec->slot_float_feasigns_.resize(float_use_slot_size_);
+      rec->slot_uint64_feasigns_.resize(uint64_use_slot_size_);
+
+      int old_offset = offset;
+      if (!parser->ParseOneInstance(line, [this, &offset, &record_vec, &max_fetch_num, &old_offset](std::vector<SlotRecord> &vec, int num){
+        vec.resize(num);
+        if (offset + num > max_fetch_num) {
+          input_channel_->WriteMove(offset, &record_vec[offset]);
+          SlotRecordPool().get(record_vec, offset);
+          record_vec.resize(max_fetch_num);
+          offset = 0;
+          old_offset = 0;
+        }
+        for (int i = 0; i < num; ++i) {
+          auto &ins = record_vec[offset + i];
+          ins->slot_float_feasigns_.resize(float_use_slot_size_);
+          ins->slot_uint64_feasigns_.resize(uint64_use_slot_size_);
+          vec[i] = ins;
+        }
+        offset = offset + num;
+      })) {
+        offset = old_offset;
+      }
+      if (offset >= max_fetch_num) {
+        input_channel_->Write(std::move(record_vec));
+        record_vec.clear();
+        SlotRecordPool().get(record_vec, max_fetch_num);
+        offset = 0;
+      }
+    };
+
+    if (BoxWrapper::GetInstance()->UseAfsApi()) {
+      while (reader->open(filename) < 0) {
+        sleep(1);
+      }
+      line_reader.read_api(reader, func);
+      reader->close();
+    } else {
+      int err_no = 0;
+      this->fp_ = fs_open_read(filename, &err_no, "");
+      CHECK(this->fp_ != nullptr);
+      __fsetlocking(&*(this->fp_), FSETLOCKING_BYCALLER);
+      line_reader.read_file(this->fp_.get(), func);
+    }
+    if (offset > 0) {
+      input_channel_->WriteMove(offset, &record_vec[0]);
+      if (offset < max_fetch_num) {
+        SlotRecordPool().put(&record_vec[offset], (max_fetch_num - offset));
+      }
+    } else {
+      SlotRecordPool().put(record_vec);
+    }
+    record_vec.clear();
+    timeline.Pause();
+    VLOG(3) << "LoadIntoMemoryByLib() read all lines, file=" << filename
+            << ", cost time=" << timeline.ElapsedSec()
+            << " seconds, thread_id=" << thread_id_;
+  }
+  if (reader != nullptr) {
+    delete reader;
+  }
+
+  VLOG(3) << "LoadIntoMemoryByLib() end, thread_id=" << thread_id_ << ", total size: " << line_reader.file_size();
+}
+
+void SlotPaddleBoxDataFeed::LoadIntoMemoryByCommand(void) {
+  std::string filename;
+  BufferedLineFileReader line_reader;
+  while (this->PickOneFile(&filename)) {
+    VLOG(3) << "PickOneFile, filename=" << filename << ", thread_id="
+        << thread_id_;
+    if (BoxWrapper::GetInstance()->UseAfsApi()) {
+      this->fp_ = BoxWrapper::GetInstance()->OpenReadFile(filename, this->pipe_command_);
+    } else {
+      int err_no = 0;
+      this->fp_ = fs_open_read(filename, &err_no, this->pipe_command_);
+    }
+    CHECK(this->fp_ != nullptr);
+    __fsetlocking(&*(this->fp_), FSETLOCKING_BYCALLER);
+
+    std::vector<SlotRecord> record_vec;
+    platform::Timer timeline;
+    timeline.Start();
+    int max_fetch_num = 10000;
+    SlotRecordPool().get(record_vec, max_fetch_num);
+
+    int offset = 0;
+    line_reader.read_file(this->fp_.get(), [this, &record_vec, &offset, &max_fetch_num](const std::string &line) {
+        if (ParseOneInstance(line, record_vec[offset])) {
+          ++offset;
+        }
+        if (offset >= max_fetch_num) {
+          input_channel_->Write(std::move(record_vec));
+          record_vec.clear();
+          SlotRecordPool().get(record_vec, max_fetch_num);
+          offset = 0;
+        }
+      });
+    if (offset > 0) {
+      input_channel_->WriteMove(offset, &record_vec[0]);
+      if (offset < max_fetch_num) {
+        SlotRecordPool().put(&record_vec[offset], (max_fetch_num - offset));
+      }
+    } else {
+      SlotRecordPool().put(record_vec);
+    }
+    record_vec.clear();
+    timeline.Pause();
+    VLOG(3) << "LoadIntoMemory() read all lines, file=" << filename
+        << ", cost time=" << timeline.ElapsedSec() << " seconds, thread_id="
+        << thread_id_;
+  }
+  VLOG(3) << "LoadIntoMemory() end, thread_id=" << thread_id_
+      << ", total size: " << line_reader.file_size();
+}
+
+static
+void parser_log_key(const std::string& log_key, uint64_t* search_id,
+    uint32_t* cmatch, uint32_t* rank) {
+  std::string searchid_str = log_key.substr(16, 16);
+  *search_id = (uint64_t) strtoull(searchid_str.c_str(), NULL, 16);
+  std::string cmatch_str = log_key.substr(11, 3);
+  *cmatch = (uint32_t) strtoul(cmatch_str.c_str(), NULL, 16);
+  std::string rank_str = log_key.substr(14, 2);
+  *rank = (uint32_t) strtoul(rank_str.c_str(), NULL, 16);
+}
+
+
+bool SlotPaddleBoxDataFeed::ParseOneInstance(const std::string &line, SlotRecord& rec) {
+  // parse line
+  const char* str = line.c_str();
+  char* endptr = const_cast<char*>(str);
+  int pos = 0;
+
+  int total_slot_num = 0;
+  rec->slot_float_feasigns_.resize(float_use_slot_size_);
+  rec->slot_uint64_feasigns_.resize(uint64_use_slot_size_);
+
+  if (parse_ins_id_) {
+    int num = strtol(&str[pos], &endptr, 10);
+    CHECK(num == 1);  // NOLINT
+    pos = endptr - str + 1;
+    size_t len = 0;
+    while (str[pos + len] != ' ') {
+      ++len;
+    }
+    rec->ins_id_ = std::string(str + pos, len);
+    pos += len + 1;
+  }
+//  if (parse_content_) {
+//    int num = strtol(&str[pos], &endptr, 10);
+//    CHECK(num == 1);  // NOLINT
+//    pos = endptr - str + 1;
+//    size_t len = 0;
+//    while (str[pos + len] != ' ') {
+//      ++len;
+//    }
+//    rec->content_ = std::string(str + pos, len);
+//    pos += len + 1;
+//  }
+  if (parse_logkey_) {
+    int num = strtol(&str[pos], &endptr, 10);
+    CHECK(num == 1);  // NOLINT
+    pos = endptr - str + 1;
+    size_t len = 0;
+    while (str[pos + len] != ' ') {
+      ++len;
+    }
+    // parse_logkey
+    std::string log_key = std::string(str + pos, len);
+    uint64_t search_id;
+    uint32_t cmatch;
+    uint32_t rank;
+    parser_log_key(log_key, &search_id, &cmatch, &rank);
+
+    rec->ins_id_ = log_key;
+    rec->search_id = search_id;
+    rec->cmatch = cmatch;
+    rec->rank = rank;
+    pos += len + 1;
+  }
+  for (size_t i = 0; i < all_slots_info_.size(); ++i) {
+    auto &info = all_slots_info_[i];
+    int num = strtol(&str[pos], &endptr, 10);
+    PADDLE_ENFORCE(
+        num,
+        "The number of ids can not be zero, you need padding "
+        "it in data generator; or if there is something wrong with "
+        "the data, please check if the data contains unresolvable "
+        "characters.\nplease check this error line: %s",
+        str);
+    if (info.used_idx != -1) {
+      if (info.type[0] == 'f') {  // float
+        auto &slot_fea = rec->slot_float_feasigns_[info.slot_value_idx];
+        for (int j = 0; j < num; ++j) {
+          float feasign = strtof(endptr, &endptr);
+          if (fabs(feasign) < 1e-6) {
+            continue;
+          }
+          slot_fea.push_back(feasign);
+          ++total_slot_num;
+        }
+      } else if (info.type[0] == 'u') {  // uint64
+        auto &slot_fea = rec->slot_uint64_feasigns_[info.slot_value_idx];
+        for (int j = 0; j < num; ++j) {
+          uint64_t feasign = (uint64_t) strtoull(endptr, &endptr, 10);
+          if (feasign == 0) {
+            continue;
+          }
+          slot_fea.push_back(feasign);
+          ++total_slot_num;
+        }
+      }
+      pos = endptr - str;
+    } else {
+      for (int j = 0; j <= num; ++j) {
+        // pos = line.find_first_of(' ', pos + 1);
+        while (line[pos + 1] != ' ') {
+          pos++;
+        }
+      }
+    }
+  }
+
+  return (total_slot_num > 0);
+}
+#endif
 }  // namespace framework
 }  // namespace paddle

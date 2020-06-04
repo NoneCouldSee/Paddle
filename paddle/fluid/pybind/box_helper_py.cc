@@ -56,6 +56,8 @@ void BindBoxHelper(py::module* m) {
       .def("load_into_memory", &framework::BoxHelper::LoadIntoMemory,
            py::call_guard<py::gil_scoped_release>())
       .def("slots_shuffle", &framework::BoxHelper::SlotsShuffle,
+           py::call_guard<py::gil_scoped_release>())
+      .def("read_ins_into_memory", &framework::BoxHelper::ReadData2Memory,
            py::call_guard<py::gil_scoped_release>());
 }  // end BoxHelper
 
